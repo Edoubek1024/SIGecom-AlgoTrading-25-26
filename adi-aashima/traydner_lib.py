@@ -25,7 +25,7 @@ def symbol_trade(symbol, side, quantity):
         print(f"Error executing trade for symbol {symbol} on side {side} at quantity {quantity}: {e}")
         return None
     
-def account_balance():
+def account_balance() -> dict:
     try:
         response = requests.get(API_BASE + f"api/remote/balance", headers={"Authorization": f"Bearer {API_KEY}"}, timeout=15)
         response.raise_for_status()
