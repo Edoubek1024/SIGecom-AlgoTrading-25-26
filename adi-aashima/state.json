@@ -1,1 +1,1 @@
-{"BTC": {"position": 0, "entry_price": null, "last_signal": null}, "ETH": {"position": -1, "entry_price": 3394.24, "last_signal": "sell"}, "SOL": {"position": 1, "entry_price": 157.53, "last_signal": "buy"}}
+{"BTC": {"position": 1, "entry_price": 102174.06, "last_signal": "buy"}, "ETH": {"position": 1, "entry_price": 3522.99, "last_signal": "buy"}, "SOL": {"position": 1, "entry_price": 162.52, "last_signal": "buy"}}

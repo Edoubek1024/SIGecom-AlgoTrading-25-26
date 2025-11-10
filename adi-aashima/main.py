@@ -6,37 +6,44 @@ from typing import Optional
 from concurrent.futures import ThreadPoolExecutor
 import traydner_lib as td
 
-# === CONFIG ===
+# === MARKET CONFIG ===
 SYMBOLS = ["BTC", "ETH", "SOL"]
 MARKET = "crypto"
 RESOLUTION = "15m"
 
-# Smaller windows for fast signal churn
-EMA_FAST = 3
-EMA_SLOW = 5
-RSI_PERIOD = 5
-
-POLL_INTERVAL = 15 * 60
+# === WINDOW CONFIG ===
+EMA_FAST = 9
+EMA_SLOW = 21
+RSI_PERIOD = 14
 RSI_OVERSOLD = 30
 RSI_OVERBOUGHT = 70
+
+# Time between trades
+POLL_INTERVAL = 15 * 60
+# Max cash to use on a single trade
 CAPITAL_FRACTION = 0.1
+# How much to lose/profit before selling
 STOP_LOSS_PCT = 0.02
 TAKE_PROFIT_PCT = 0.04
-LOG_FILE = "trade_log.jsonl"
-MAX_THREADS = 5
+# Minimum fraction of symbol to buy
 MIN_QTY = 1e-6
+
+MAX_THREADS = 5
+
+LOG_FILE = "./adi-aashima/trade_log.jsonl"
+STATE_FILE = "./adi-aashima/state.json"
 
 # === STATE ===
 state = {s: {"position": 0, "entry_price": None, "last_signal": None} for s in SYMBOLS}
 
 def save_state():
-    with open("state.json", "w") as f:
+    with open(STATE_FILE, "w") as f:
         json.dump(state, f)
 
 def load_state():
     global state
     try:
-        with open("state.json") as f:
+        with open(STATE_FILE) as f:
             state.update(json.load(f))
     except FileNotFoundError:
         pass
@@ -216,7 +223,7 @@ def trade_logic(symbol: str):
 
     signal = get_signal(symbol, candles)
     if signal is None or signal == st["last_signal"]:
-        log_event(symbol, "no_signals", {"last_signal": st["last_signal"], "signal": signal})
+        log_event(symbol, "no_new_signals", {"last_signal": st["last_signal"], "signal": signal})
         return
 
     side_for_qty = "buy" if signal == "buy" else "sell"
