@@ -7,8 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 import traydner_lib as td
 
 # === MARKET CONFIG ===
-SYMBOLS = ["BTC", "ETH", "SOL"]
-MARKET = "crypto"
+SYMBOLS = [["BTC", "crypto"], ["ETH", "crypto"], ["SOL", "crypto"], ["INR", "forex"], ["ZAR", "forex"], ["JPY", "forex"]]
 RESOLUTION = "15m"
 
 # === WINDOW CONFIG ===
@@ -34,7 +33,7 @@ LOG_FILE = "./adi-aashima/trade_log.jsonl"
 STATE_FILE = "./adi-aashima/state.json"
 
 # === STATE ===
-state = {s: {"position": 0, "entry_price": None, "last_signal": None} for s in SYMBOLS}
+state = {s[0]: {"position": 0, "entry_price": None, "last_signal": None} for s in SYMBOLS}
 
 def save_state():
     with open(STATE_FILE, "w") as f:
@@ -45,16 +44,16 @@ def load_state():
     try:
         with open(STATE_FILE) as f:
             state.update(json.load(f))
-    except FileNotFoundError:
+    except json.decoder.JSONDecodeError:
         pass
 
-def log_event(symbol: str, event_type: str, data: dict):
+def log_event(symbol: list[str], event_type: str, data: dict):
     entry = {"time": datetime.now().isoformat(), "symbol": symbol, "event": event_type, **data}
     with open(LOG_FILE, "a") as f:
         f.write(json.dumps(entry) + "\n")
 
-def fetch_candles(symbol: str, resolution: str, limit: int = 500):
-    data = td.symbol_history(symbol, resolution, limit)
+def fetch_candles(symbol: list[str], resolution: str, limit: int = 500):
+    data = td.symbol_history(symbol[0], resolution, limit)
     if not data or "history" not in data:
         log_event(symbol, "error", {"msg": "Failed to fetch candles", "returned": bool(data)})
         return None
@@ -82,7 +81,7 @@ def compute_rsi(series: pd.Series, period: int) -> pd.Series:
     rsi = 100 - (100 / (1 + rs))
     return rsi
 
-def get_signal(symbol: str, df: pd.DataFrame, enter_on_trend: bool = True) -> Optional[str]:
+def get_signal(symbol: list[str], df: pd.DataFrame, enter_on_trend: bool = True) -> Optional[str]:
     df = df.copy()
     if len(df) < max(EMA_SLOW, RSI_PERIOD) + 1:
         log_event(symbol, "insufficient_history", {"have": len(df), "need": max(EMA_SLOW, RSI_PERIOD) + 1})
@@ -129,8 +128,8 @@ def get_signal(symbol: str, df: pd.DataFrame, enter_on_trend: bool = True) -> Op
 
     return None
 
-def qty_from_balance(symbol: str, side: str):
-    price_info = td.symbol_price(symbol)
+def qty_from_balance(symbol: list[str], side: str):
+    price_info = td.symbol_price(symbol[0])
     if not price_info:
         log_event(symbol, "no_price_info_for_qty", {})
         return 0.0
@@ -145,17 +144,17 @@ def qty_from_balance(symbol: str, side: str):
     if not bal:
         log_event(symbol, "no_balance_info", {})
         return 0.0
-
+    
+    cash = bal.get("cash")
     if side == "buy":
-        cash = bal.get("cash")
         qty = (cash * CAPITAL_FRACTION) / price if price > 0 else 0.0
     else:  # sell
         holding = 0.0
-        market_holdings = bal.get(MARKET)
+        market_holdings = bal.get(symbol[1])
         if isinstance(market_holdings, dict):
-            holding = float(market_holdings.get(symbol, 0) or 0)
+            holding = float(market_holdings.get(symbol[0], 0) or 0)
         else:
-            holding = float(bal.get(symbol, 0) or 0)
+            holding = float(bal.get(symbol[0], 0) or 0)
         qty = holding
 
     if qty < MIN_QTY:
@@ -163,8 +162,8 @@ def qty_from_balance(symbol: str, side: str):
         return 0.0
     return float(qty)
 
-def check_stops(symbol: str, price: float):
-    st = state[symbol]
+def check_stops(symbol: list[str], price: float):
+    st = state[symbol[0]]
     if st["position"] == 0 or not st["entry_price"]:
         return
     entry = st["entry_price"]
@@ -174,31 +173,31 @@ def check_stops(symbol: str, price: float):
             log_event(symbol, "stop_loss_long", {"price": price, "entry": entry, "change": change})
             qty = qty_from_balance(symbol, "sell")
             if qty > 0:
-                td.symbol_trade(symbol, "sell", qty)
+                td.symbol_trade(symbol[0], "sell", qty)
             st.update({"position": 0, "entry_price": None, "last_signal": None})
         elif change >= TAKE_PROFIT_PCT:
             log_event(symbol, "take_profit_long", {"price": price, "entry": entry, "change": change})
             qty = qty_from_balance(symbol, "sell")
             if qty > 0:
-                td.symbol_trade(symbol, "sell", qty)
+                td.symbol_trade(symbol[0], "sell", qty)
             st.update({"position": 0, "entry_price": None, "last_signal": None})
     elif st["position"] == -1:
         if change >= STOP_LOSS_PCT:
             log_event(symbol, "stop_loss_short", {"price": price, "entry": entry, "change": change})
             qty = qty_from_balance(symbol, "buy")
             if qty > 0:
-                td.symbol_trade(symbol, "buy", qty)
+                td.symbol_trade(symbol[0], "buy", qty)
             st.update({"position": 0, "entry_price": None, "last_signal": None})
         elif change <= -TAKE_PROFIT_PCT:
             log_event(symbol, "take_profit_short", {"price": price, "entry": entry, "change": change})
             qty = qty_from_balance(symbol, "buy")
             if qty > 0:
-                td.symbol_trade(symbol, "buy", qty)
+                td.symbol_trade(symbol[0], "buy", qty)
             st.update({"position": 0, "entry_price": None, "last_signal": None})
 
-def trade_logic(symbol: str):
-    st = state[symbol]
-    status = td.market_status(MARKET)
+def trade_logic(symbol: list[str]):
+    st = state[symbol[0]]
+    status = td.market_status(symbol[1])
     if not status or not status.get("isOpen", True):
         log_event(symbol, "market_closed", {})
         return
@@ -208,7 +207,7 @@ def trade_logic(symbol: str):
         log_event(symbol, "no_candles", {})
         return
 
-    price_info = td.symbol_price(symbol)
+    price_info = td.symbol_price(symbol[0])
     if not price_info:
         log_event(symbol, "no_price_info", {})
         return
@@ -233,11 +232,11 @@ def trade_logic(symbol: str):
         return
 
     if signal == "buy" and st["position"] <= 0:
-        td.symbol_trade(symbol, "buy", qty)
+        td.symbol_trade(symbol[0], "buy", qty)
         st.update({"position": 1, "entry_price": price, "last_signal": signal})
         log_event(symbol, "buy", {"qty": qty, "price": price})
     elif signal == "sell" and st["position"] >= 0:
-        td.symbol_trade(symbol, "sell", qty)
+        td.symbol_trade(symbol[0], "sell", qty)
         st.update({"position": -1, "entry_price": price, "last_signal": signal})
         log_event(symbol, "sell", {"qty": qty, "price": price})
 
