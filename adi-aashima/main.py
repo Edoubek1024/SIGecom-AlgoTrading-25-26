@@ -32,28 +32,33 @@ MAX_THREADS = 5
 LOG_FILE = "./adi-aashima/trade_log.jsonl"
 STATE_FILE = "./adi-aashima/state.json"
 
+NULL_STATE = False
+
 # === STATE ===
-state = {s[0]: {"position": 0, "entry_price": None, "last_signal": None} for s in SYMBOLS}
+state = {s[0]: {"position": 0, "entry_price": None, "last_signal": None, "market": s[1]} for s in SYMBOLS}
 
 def save_state():
+    """Save state to file."""
     with open(STATE_FILE, "w") as f:
         json.dump(state, f)
 
 def load_state():
+    """Load state from file."""
     global state
+    global NULL_STATE
     try:
         with open(STATE_FILE) as f:
             state.update(json.load(f))
     except json.decoder.JSONDecodeError:
-        pass
+        NULL_STATE = True
 
-def log_event(symbol: list[str], event_type: str, data: dict):
+def log_event(symbol: str, event_type: str, data: dict):
     entry = {"time": datetime.now().isoformat(), "symbol": symbol, "event": event_type, **data}
     with open(LOG_FILE, "a") as f:
         f.write(json.dumps(entry) + "\n")
 
-def fetch_candles(symbol: list[str], resolution: str, limit: int = 500):
-    data = td.symbol_history(symbol[0], resolution, limit)
+def fetch_candles(symbol: str, resolution: str, limit: int = 500):
+    data = td.symbol_history(symbol, resolution, limit)
     if not data or "history" not in data:
         log_event(symbol, "error", {"msg": "Failed to fetch candles", "returned": bool(data)})
         return None
@@ -63,7 +68,6 @@ def fetch_candles(symbol: list[str], resolution: str, limit: int = 500):
         return None
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s")
     df.set_index("timestamp", inplace=True)
-    # CRITICAL: ensure chronological ascending order
     df.sort_index(inplace=True)
     df["close"] = pd.to_numeric(df["close"], errors="coerce")
     return df
@@ -81,7 +85,7 @@ def compute_rsi(series: pd.Series, period: int) -> pd.Series:
     rsi = 100 - (100 / (1 + rs))
     return rsi
 
-def get_signal(symbol: list[str], df: pd.DataFrame, enter_on_trend: bool = True) -> Optional[str]:
+def get_signal(symbol: str, df: pd.DataFrame, enter_on_trend: bool = True) -> Optional[str]:
     df = df.copy()
     if len(df) < max(EMA_SLOW, RSI_PERIOD) + 1:
         log_event(symbol, "insufficient_history", {"have": len(df), "need": max(EMA_SLOW, RSI_PERIOD) + 1})
@@ -113,13 +117,13 @@ def get_signal(symbol: list[str], df: pd.DataFrame, enter_on_trend: bool = True)
         "last_rsi": float(last["rsi"])
     })
 
-    # CROSS signals (higher confidence)
+    # CROSS signals
     if prev["ema_fast"] <= prev["ema_slow"] and last["ema_fast"] > last["ema_slow"] and last["rsi"] < RSI_OVERBOUGHT:
         return "buy"
     if prev["ema_fast"] >= prev["ema_slow"] and last["ema_fast"] < last["ema_slow"] and last["rsi"] > RSI_OVERBOUGHT:
         return "sell"
 
-    # TREND entry (lower confidence). Enter if already in desired state
+    # TREND entry
     if enter_on_trend:
         if last["ema_fast"] > last["ema_slow"] and last["rsi"] < RSI_OVERBOUGHT:
             return "buy"
@@ -128,33 +132,26 @@ def get_signal(symbol: list[str], df: pd.DataFrame, enter_on_trend: bool = True)
 
     return None
 
-def qty_from_balance(symbol: list[str], side: str):
-    price_info = td.symbol_price(symbol[0])
+def qty_from_balance(symbol: str, market: str, side: str):
+    price_info = td.symbol_price(symbol)
     if not price_info:
         log_event(symbol, "no_price_info_for_qty", {})
         return 0.0
-    price = price_info.get("price") or price_info.get("last") or price_info.get("last_price") or price_info.get("close")
-    try:
-        price = float(price)
-    except Exception:
-        log_event(symbol, "price_parse_error", {"price_info": price_info})
-        return 0.0
+    price = float(price_info.get("price") or price_info.get("last") or price_info.get("last_price") or price_info.get("close") or 0)
 
-    bal: dict = td.account_balance().get("balance")
-    if not bal:
-        log_event(symbol, "no_balance_info", {})
-        return 0.0
+    bal: dict = td.account_balance().get("balance") or {}
+    cash = bal.get("cash", 0.0)
     
-    cash = bal.get("cash")
     if side == "buy":
         qty = (cash * CAPITAL_FRACTION) / price if price > 0 else 0.0
-    else:  # sell
+    else:
+        # Get holdings
         holding = 0.0
-        market_holdings = bal.get(symbol[1])
+        market_holdings = bal.get(market)
         if isinstance(market_holdings, dict):
-            holding = float(market_holdings.get(symbol[0], 0) or 0)
+            holding = float(market_holdings.get(symbol, 0) or 0)
         else:
-            holding = float(bal.get(symbol[0], 0) or 0)
+            holding = float(bal.get(symbol, 0) or 0)
         qty = holding
 
     if qty < MIN_QTY:
@@ -162,42 +159,42 @@ def qty_from_balance(symbol: list[str], side: str):
         return 0.0
     return float(qty)
 
-def check_stops(symbol: list[str], price: float):
-    st = state[symbol[0]]
-    if st["position"] == 0 or not st["entry_price"]:
+
+def check_stops(symbol: str, market: str, price: float):
+    st = state.get(symbol)
+    if not st or st["position"] == 0 or not st["entry_price"]:
         return
+
     entry = st["entry_price"]
     change = (price - entry) / entry
+
     if st["position"] == 1:
-        if change <= -STOP_LOSS_PCT:
-            log_event(symbol, "stop_loss_long", {"price": price, "entry": entry, "change": change})
-            qty = qty_from_balance(symbol, "sell")
+        if change <= -STOP_LOSS_PCT or change >= TAKE_PROFIT_PCT:
+            side = "sell"
+            qty = qty_from_balance(symbol, market, side)
             if qty > 0:
-                td.symbol_trade(symbol[0], "sell", qty)
-            st.update({"position": 0, "entry_price": None, "last_signal": None})
-        elif change >= TAKE_PROFIT_PCT:
-            log_event(symbol, "take_profit_long", {"price": price, "entry": entry, "change": change})
-            qty = qty_from_balance(symbol, "sell")
-            if qty > 0:
-                td.symbol_trade(symbol[0], "sell", qty)
-            st.update({"position": 0, "entry_price": None, "last_signal": None})
-    elif st["position"] == -1:
-        if change >= STOP_LOSS_PCT:
-            log_event(symbol, "stop_loss_short", {"price": price, "entry": entry, "change": change})
-            qty = qty_from_balance(symbol, "buy")
-            if qty > 0:
-                td.symbol_trade(symbol[0], "buy", qty)
-            st.update({"position": 0, "entry_price": None, "last_signal": None})
-        elif change <= -TAKE_PROFIT_PCT:
-            log_event(symbol, "take_profit_short", {"price": price, "entry": entry, "change": change})
-            qty = qty_from_balance(symbol, "buy")
-            if qty > 0:
-                td.symbol_trade(symbol[0], "buy", qty)
+                td.symbol_trade(symbol, side, qty)
+            log_event(symbol, "stop_or_profit_long", {"price": price, "entry": entry, "change": change, "qty": qty})
             st.update({"position": 0, "entry_price": None, "last_signal": None})
 
-def trade_logic(symbol: list[str]):
-    st = state[symbol[0]]
-    status = td.market_status(symbol[1])
+    elif st["position"] == -1:
+        if change >= STOP_LOSS_PCT or change <= -TAKE_PROFIT_PCT:
+            side = "buy"
+            qty = qty_from_balance(symbol, market, side)
+            if qty > 0:
+                td.symbol_trade(symbol, side, qty)
+            log_event(symbol, "stop_or_profit_short", {"price": price, "entry": entry, "change": change, "qty": qty})
+            st.update({"position": 0, "entry_price": None, "last_signal": None})
+
+def trade_logic(symbol: str):
+    global NULL_STATE
+
+    st = state.get(symbol)
+    if not st:
+        return
+
+    market = st.get('market')
+    status = td.market_status(market)
     if not status or not status.get("isOpen", True):
         log_event(symbol, "market_closed", {})
         return
@@ -207,36 +204,42 @@ def trade_logic(symbol: list[str]):
         log_event(symbol, "no_candles", {})
         return
 
-    price_info = td.symbol_price(symbol[0])
+    price_info = td.symbol_price(symbol)
     if not price_info:
         log_event(symbol, "no_price_info", {})
         return
-    price = price_info.get("price") or price_info.get("last") or price_info.get("last_price") or price_info.get("close")
-    try:
-        price = float(price)
-    except Exception:
-        log_event(symbol, "price_parse_error", {"price_info": price_info})
+
+    price = float(price_info.get("price") or price_info.get("last") or price_info.get("last_price") or price_info.get("close") or 0)
+    check_stops(symbol, market, price)
+
+    st = state.get(symbol)
+    if not st:
         return
-
-    check_stops(symbol, price)
-
+    
     signal = get_signal(symbol, candles)
     if signal is None or signal == st["last_signal"]:
         log_event(symbol, "no_new_signals", {"last_signal": st["last_signal"], "signal": signal})
+        if NULL_STATE:
+            save_state()
+            NULL_STATE = False
         return
-
+    
     side_for_qty = "buy" if signal == "buy" else "sell"
-    qty = qty_from_balance(symbol, side_for_qty)
-    if qty <= 0:
+    qty = qty_from_balance(symbol, market, side_for_qty)
+    if qty < MIN_QTY:
         log_event(symbol, "invalid_qty", {"qty": qty, "side": side_for_qty})
+        if NULL_STATE:
+            save_state()
+            NULL_STATE = False
         return
 
     if signal == "buy" and st["position"] <= 0:
-        td.symbol_trade(symbol[0], "buy", qty)
+        td.symbol_trade(symbol, "buy", qty)
         st.update({"position": 1, "entry_price": price, "last_signal": signal})
         log_event(symbol, "buy", {"qty": qty, "price": price})
+
     elif signal == "sell" and st["position"] >= 0:
-        td.symbol_trade(symbol[0], "sell", qty)
+        td.symbol_trade(symbol, "sell", qty)
         st.update({"position": -1, "entry_price": price, "last_signal": signal})
         log_event(symbol, "sell", {"qty": qty, "price": price})
 
@@ -246,9 +249,10 @@ def main():
     print(f"Starting EMA+RSI Bot on {SYMBOLS} at {RESOLUTION}")
     load_state()
     log_event("system", "start", {"symbols": SYMBOLS, "resolution": RESOLUTION})
+
     executor = ThreadPoolExecutor(max_workers=MAX_THREADS)
     while True:
-        futures = [executor.submit(trade_logic, sym) for sym in SYMBOLS]
+        futures = [executor.submit(trade_logic, sym) for sym in list(state.keys())]
         for f in futures:
             f.result()
         time.sleep(POLL_INTERVAL)

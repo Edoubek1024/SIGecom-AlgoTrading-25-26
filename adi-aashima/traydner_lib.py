@@ -7,7 +7,7 @@ load_dotenv()
 API_BASE = "https://traydner-186649552655.us-central1.run.app/"
 API_KEY = os.getenv("API_KEY")
 
-def symbol_price(symbol):
+def symbol_price(symbol) -> dict:
     try:
         response = requests.get(API_BASE + f"api/remote/price?symbol={symbol}", headers={"Authorization": f"Bearer {API_KEY}"}, timeout=15)
         response.raise_for_status()
